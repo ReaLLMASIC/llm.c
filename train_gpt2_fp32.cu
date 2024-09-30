@@ -299,6 +299,25 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     }
 }
 
+//ReLU forward kernel
+__global__ void relu_forward_kernel(float* out, const float* inp, int N, int T) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= N * T) {
+        return;
+    }
+
+    int n = idx / T;
+    int t = idx % T;
+
+    float value = inp[n * T + t];
+    float activated_value = value > 0 ? value : 0;
+
+    out[n * T + t] = activated_value;
+}
+
 __global__ void residual_forward_kernel(float* out, float* inp1, float* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -442,6 +461,54 @@ __global__ void layernorm_backward_kernel2(float* dinp, float* dweight, float* d
         atomicAdd(&dweight[i], dweight_shared[i]);
 	}
 }
+
+// ReLU backward kernel
+__global__ void relu_autoregressive_backward_kernel(float* dpreact, const float* dattr, const float* attr,
+    int B, int T, int C, float scale) {
+    constexpr const int BlockSize = 256;
+    constexpr int T_per_block = 4;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float block_acc[32];
+
+    int idx = blockIdx.y;
+    int t0 = T - 1 - T_per_block * blockIdx.x;
+
+    attr += idx * T * T;
+    dattr += idx * T * T;
+    dpreact += idx * T * T;
+
+    if (warp.meta_group_rank() == 0) {
+        block_acc[warp.thread_rank()] = 0;
+    }
+
+    for (int to = 0; to < T_per_block; ++to) {
+        int t = t0 - to;
+        if (t < 0) return;
+
+        const float* attr_bth = attr + t * T;
+        const float* dattr_bth = dattr + t * T;
+        float* dpreact_bth = dpreact + t * T;
+
+        float local_sum = 0;
+
+        for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
+            // ReLU derivative: if input (attr_bth[t2]) > 0, gradient is dattr_bth[t2], else 0
+            float gradient = attr_bth[t2] > 0 ? dattr_bth[t2] : 0.0f;
+            local_sum += gradient;
+        }
+
+        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
+        block.sync();
+        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+
+        for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
+            float acc = __ldcs(attr_bth + t3) > 0 ? __ldcs(dattr_bth + t3) - local_sum : 0.0f;
+            __stcs(dpreact_bth + t3, scale * acc);
+        }
+    }
+}
+
 
 __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const float* datt, const float* att,
                                                        int B, int T, int C, float scale) {
@@ -737,7 +804,7 @@ void matmul_forward(float* out,
 
 void attention_forward(float* out, float* qkvr, float* att,
                        float* inp,
-                       int B, int T, int C, int NH) {
+                       int B, int T, int C, int NH, int use_relu) {
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
     const int block_size = 256;
@@ -767,7 +834,12 @@ void attention_forward(float* out, float* qkvr, float* att,
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    if (use_relu == 0) {
+        softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    }
+    else {
+        relu_forward_kernel<<<grid_size, softmax_block_size>>>(att, preatt, B * NH , T);
+    }
     cudaCheck(cudaGetLastError());
 
     // new approach: first cuBLAS another batched matmul
@@ -837,7 +909,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
 void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, float* scratch,
                         const float* dout,
                         const float* qkvr, const float* att,
-                        int B, int T, int C, int NH) {
+                        int B, int T, int C, int NH, int use_relu) {
     const int block_size = 256;
     int HS = C / NH; // head size
     const float one = 1.0f;
@@ -862,7 +934,12 @@ void attention_backward(float* dinp, float* dqkvr, float* dpreatt, float* datt, 
     // backward into preatt
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
-    softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    if (use_relu == 0) {
+        softmax_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    }
+    else {
+        relu_autoregressive_backward_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, datt, att, B, T, C, scale);
+    }
     cudaCheck(cudaGetLastError());
     // backward into q
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &one, k, HS, T * HS, dpreatt, T, T * T, &zero, dq, HS, T * HS, B * NH));
@@ -1169,7 +1246,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T, int use_relu) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -1273,7 +1350,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, use_relu);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1311,7 +1388,7 @@ void gpt2_zero_grad(GPT2 *model) {
     if (model->grads_memory != NULL) { cudaCheck(cudaMemset(model->grads_memory, 0, model->num_parameters * sizeof(float))); }
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, int use_relu) {
 
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
@@ -1427,7 +1504,7 @@ void gpt2_backward(GPT2 *model) {
         float* buffer_a = l_atty;
         float* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
 
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, use_relu);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
@@ -1572,6 +1649,7 @@ int main(int argc, char *argv[]) {
     int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
+    int use_relu = 0; // use ReLU instead of Softmax
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -1587,6 +1665,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { use_relu = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1602,6 +1681,7 @@ int main(int argc, char *argv[]) {
     printf("| val_max_steps         | %-50d |\n", val_max_steps);
     printf("| sample_every          | %-50d |\n", sample_every);
     printf("| genT                  | %-50d |\n", genT);
+    printf("| use_relu              | %-50s |\n", use_relu ? "true" : "false");
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // set up the device
@@ -1671,7 +1751,7 @@ int main(int argc, char *argv[]) {
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T, use_relu);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -1692,7 +1772,7 @@ int main(int argc, char *argv[]) {
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                gpt2_forward(&model, gen_tokens, NULL, B, T, use_relu);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -1725,9 +1805,9 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, use_relu);
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
+        gpt2_backward(&model, use_relu);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
