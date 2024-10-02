@@ -1,9 +1,21 @@
 # llm.c
 
 ## ReLUFlashAttention profiling section
+To profile ReLUFlashAttention in dev/cuda/attention_forward.cu, you need
+make attention_forward.cu
+To profile FlashAttention:
+./attention_forward 2
+To profile ReLUFlashAttention:
+./attention_forward 11
+
 
 
 ## ReLU as softmax direct replacement model training
+To profile ReLU forward kernel in train_gpt2_fp32.cu, you need to download
+Nvidia Nsight Compute (https://developer.nvidia.com/nsight-compute)
+Then try:
+sudo /usr/local/cuda/bin/nv-nsight-cu-cli --target-processes all --kernel-name "relu_forward_kernel" --profile-from-start on --launch-skip 30 --launch-count 1 ./train_gpt2fp32cu
+
 
 LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on CUDA MODE Discord.
 
