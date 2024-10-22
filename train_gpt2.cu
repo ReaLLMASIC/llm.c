@@ -521,6 +521,7 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     assert(depth > 0); // atoi returns 0 if not a number
     int channels, num_heads;
     if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
+    else if (depth == 32)  { channels = 512; num_heads = 8; }  // ReaLLMASIC
     else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
     else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
     else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
